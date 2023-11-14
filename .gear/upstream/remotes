@@ -1,0 +1,3 @@
+[remote "upstream"]
+	url = https://github.com/AzureAD/microsoft-authentication-library-for-python
+	fetch = +refs/heads/*:refs/remotes/upstream/*
