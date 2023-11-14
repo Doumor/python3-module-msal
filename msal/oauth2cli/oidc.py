@@ -1,6 +1,10 @@
 import json
 import base64
 import time
+import random
+import string
+import warnings
+import hashlib
 
 from . import oauth2
 
@@ -38,12 +42,13 @@ def decode_id_token(id_token, client_id=None, issuer=None, nonce=None, now=None)
     """
     decoded = json.loads(decode_part(id_token.split('.')[1]))
     err = None  # https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-    _now = now or time.time()
+    _now = int(now or time.time())
     skew = 120  # 2 minutes
+    TIME_SUGGESTION = "Make sure your computer's time and time zone are both correct."
     if _now + skew < decoded.get("nbf", _now - 1):  # nbf is optional per JWT specs
         # This is not an ID token validation, but a JWT validation
         # https://tools.ietf.org/html/rfc7519#section-4.1.5
-        err = "0. The ID token is not yet valid"
+        err = "0. The ID token is not yet valid. " + TIME_SUGGESTION
     if issuer and issuer != decoded["iss"]:
         # https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationResponse
         err = ('2. The Issuer Identifier for the OpenID Provider, "%s", '
@@ -53,21 +58,43 @@ def decode_id_token(id_token, client_id=None, issuer=None, nonce=None, now=None)
         valid_aud = client_id in decoded["aud"] if isinstance(
             decoded["aud"], list) else client_id == decoded["aud"]
         if not valid_aud:
-            err = "3. The aud (audience) Claim must contain this client's client_id."
+            err = (
+                "3. The aud (audience) claim must contain this client's client_id "
+                '"%s", case-sensitively. Was your client_id in wrong casing?'
+                # Some IdP accepts wrong casing request but issues right casing IDT
+                ) % client_id
     # Per specs:
     # 6. If the ID Token is received via direct communication between
-    # the Client and the Token Endpoint (which it is in this flow),
+    # the Client and the Token Endpoint (which it is during _obtain_token()),
     # the TLS server validation MAY be used to validate the issuer
     # in place of checking the token signature.
-    if _now > decoded["exp"]:
-        err = "9. The current time MUST be before the time represented by the exp Claim."
+    if _now - skew > decoded["exp"]:
+        err = "9. The ID token already expires. " + TIME_SUGGESTION
     if nonce and nonce != decoded.get("nonce"):
         err = ("11. Nonce must be the same value "
-            "as the one that was sent in the Authentication Request")
+            "as the one that was sent in the Authentication Request.")
     if err:
-        raise RuntimeError("%s id_token was: %s" % (
-            err, json.dumps(decoded, indent=2)))
+        raise RuntimeError("%s Current epoch = %s.  The id_token was: %s" % (
+            err, _now, json.dumps(decoded, indent=2)))
     return decoded
+
+
+def _nonce_hash(nonce):
+    # https://openid.net/specs/openid-connect-core-1_0.html#NonceNotes
+    return hashlib.sha256(nonce.encode("ascii")).hexdigest()
+
+
+class Prompt(object):
+    """This class defines the constant strings for prompt parameter.
+
+    The values are based on
+    https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
+    """
+    NONE = "none"
+    LOGIN = "login"
+    CONSENT = "consent"
+    SELECT_ACCOUNT = "select_account"
+    CREATE = "create"  # Defined in https://openid.net/specs/openid-connect-prompt-create-1_0.html#PromptParameter
 
 
 class Client(oauth2.Client):
@@ -101,6 +128,7 @@ class Client(oauth2.Client):
             A hard-to-guess string used to mitigate replay attacks. See also
             `OIDC specs <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
         """
+        warnings.warn("Use initiate_auth_code_flow() instead", DeprecationWarning)
         return super(Client, self).build_auth_request_uri(
             response_type, nonce=nonce, **kwargs)
 
@@ -116,6 +144,8 @@ class Client(oauth2.Client):
             same nonce should also be provided here, so that we'll validate it.
             An exception will be raised if the nonce in id token mismatches.
         """
+        warnings.warn(
+            "Use obtain_token_by_auth_code_flow() instead", DeprecationWarning)
         result = super(Client, self).obtain_token_by_authorization_code(
             code, **kwargs)
         nonce_in_id_token = result.get("id_token_claims", {}).get("nonce")
@@ -124,4 +154,131 @@ class Client(oauth2.Client):
                 'The nonce in id token ("%s") should match your nonce ("%s")' %
                 (nonce_in_id_token, nonce))
         return result
+
+    def initiate_auth_code_flow(
+            self,
+            scope=None,
+            **kwargs):
+        """Initiate an auth code flow.
+
+        It provides nonce protection automatically.
+
+        :param list scope:
+            A list of strings, e.g. ["profile", "email", ...].
+            This method will automatically send ["openid"] to the wire,
+            although it won't modify your input list.
+
+        See :func:`oauth2.Client.initiate_auth_code_flow` in parent class
+        for descriptions on other parameters and return value.
+        """
+        if "id_token" in kwargs.get("response_type", ""):
+            # Implicit grant would cause auth response coming back in #fragment,
+            # but fragment won't reach a web service.
+            raise ValueError('response_type="id_token ..." is not allowed')
+        _scope = list(scope) if scope else []  # We won't modify input parameter
+        if "openid" not in _scope:
+            # "If no openid scope value is present,
+            # the request may still be a valid OAuth 2.0 request,
+            # but is not an OpenID Connect request." -- OIDC Core Specs, 3.1.2.2
+            # https://openid.net/specs/openid-connect-core-1_0.html#AuthRequestValidation
+            # Here we just automatically add it. If the caller do not want id_token,
+            # they should simply go with oauth2.Client.
+            _scope.append("openid")
+        nonce = "".join(random.sample(string.ascii_letters, 16))
+        flow = super(Client, self).initiate_auth_code_flow(
+            scope=_scope, nonce=_nonce_hash(nonce), **kwargs)
+        flow["nonce"] = nonce
+        if kwargs.get("max_age") is not None:
+            flow["max_age"] = kwargs["max_age"]
+        return flow
+
+    def obtain_token_by_auth_code_flow(self, auth_code_flow, auth_response, **kwargs):
+        """Validate the auth_response being redirected back, and then obtain tokens,
+        including ID token which can be used for user sign in.
+
+        Internally, it implements nonce to mitigate replay attack.
+        It also implements PKCE to mitigate the auth code interception attack.
+
+        See :func:`oauth2.Client.obtain_token_by_auth_code_flow` in parent class
+        for descriptions on other parameters and return value.
+        """
+        result = super(Client, self).obtain_token_by_auth_code_flow(
+            auth_code_flow, auth_response, **kwargs)
+        if "id_token_claims" in result:
+            nonce_in_id_token = result.get("id_token_claims", {}).get("nonce")
+            expected_hash = _nonce_hash(auth_code_flow["nonce"])
+            if nonce_in_id_token != expected_hash:
+                raise RuntimeError(
+                    'The nonce in id token ("%s") should match our nonce ("%s")' %
+                    (nonce_in_id_token, expected_hash))
+
+            if auth_code_flow.get("max_age") is not None:
+                auth_time = result.get("id_token_claims", {}).get("auth_time")
+                if not auth_time:
+                    raise RuntimeError(
+                        "13. max_age was requested, ID token should contain auth_time")
+                now = int(time.time())
+                skew = 120  # 2 minutes. Hardcoded, for now
+                if now - skew > auth_time + auth_code_flow["max_age"]:
+                    raise RuntimeError(
+                            "13. auth_time ({auth_time}) was requested, "
+                            "by using max_age ({max_age}) parameter, "
+                            "and now ({now}) too much time has elasped "
+                            "since last end-user authentication. "
+                            "The ID token was: {id_token}".format(
+                        auth_time=auth_time,
+                        max_age=auth_code_flow["max_age"],
+                        now=now,
+                        id_token=json.dumps(result["id_token_claims"], indent=2),
+                        ))
+        return result
+
+    def obtain_token_by_browser(
+            self,
+            display=None,
+            prompt=None,
+            max_age=None,
+            ui_locales=None,
+            id_token_hint=None,  # It is relevant,
+                # because this library exposes raw ID token
+            login_hint=None,
+            acr_values=None,
+            **kwargs):
+        """A native app can use this method to obtain token via a local browser.
+
+        Internally, it implements nonce to mitigate replay attack.
+        It also implements PKCE to mitigate the auth code interception attack.
+
+        :param string display: Defined in
+            `OIDC <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
+        :param string prompt: Defined in
+            `OIDC <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
+            You can find the valid string values defined in :class:`oidc.Prompt`.
+
+        :param int max_age: Defined in
+            `OIDC <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
+        :param string ui_locales: Defined in
+            `OIDC <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
+        :param string id_token_hint: Defined in
+            `OIDC <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
+        :param string login_hint: Defined in
+            `OIDC <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
+        :param string acr_values: Defined in
+            `OIDC <https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest>`_.
+
+        See :func:`oauth2.Client.obtain_token_by_browser` in parent class
+        for descriptions on other parameters and return value.
+        """
+        filtered_params = {k:v for k, v in dict(
+            prompt=" ".join(prompt) if isinstance(prompt, (list, tuple)) else prompt,
+            display=display,
+            max_age=max_age,
+            ui_locales=ui_locales,
+            id_token_hint=id_token_hint,
+            login_hint=login_hint,
+            acr_values=acr_values,
+            ).items() if v is not None}  # Filter out None values
+        return super(Client, self).obtain_token_by_browser(
+            auth_params=dict(kwargs.pop("auth_params", {}), **filtered_params),
+            **kwargs)
 

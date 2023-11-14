@@ -4,10 +4,17 @@ import base64
 import uuid
 import logging
 
-import jwt
-
 
 logger = logging.getLogger(__name__)
+
+
+def _str2bytes(raw):
+    # A conversion based on duck-typing rather than six.text_type
+    try:  # Assuming it is a string
+        return raw.encode(encoding="utf-8")
+    except:  # Otherwise we treat it as bytes and return it as-is
+        return raw
+
 
 class AssertionCreator(object):
     def create_normal_assertion(
@@ -63,7 +70,11 @@ class JwtAssertionCreator(AssertionCreator):
 
         Args:
 
-            key (str): The key for signing, e.g. a base64 encoded private key.
+            key (str):
+                An unencrypted private key for signing, in a base64 encoded string.
+                It can also be a cryptography ``PrivateKey`` object,
+                which is how you can work with a previously-encrypted key.
+                See also https://github.com/jpadilla/pyjwt/pull/525
             algorithm (str):
                 "RS256", etc.. See https://pyjwt.readthedocs.io/en/latest/algorithms.html
                 RSA and ECDSA algorithms require "pip install cryptography".
@@ -86,6 +97,7 @@ class JwtAssertionCreator(AssertionCreator):
         Parameters are defined in https://tools.ietf.org/html/rfc7523#section-3
         Key-value pairs in additional_claims will be added into payload as-is.
         """
+        import jwt  # Lazy loading
         now = time.time()
         payload = {
             'aud': audience,
@@ -99,10 +111,11 @@ class JwtAssertionCreator(AssertionCreator):
             payload['nbf'] = not_before
         payload.update(additional_claims or {})
         try:
-            return jwt.encode(
+            str_or_bytes = jwt.encode(  # PyJWT 1 returns bytes, PyJWT 2 returns str
                 payload, self.key, algorithm=self.algorithm, headers=self.headers)
+            return _str2bytes(str_or_bytes)  # We normalize them into bytes
         except:
-            if self.algorithm.startswith("RS") or self.algorithm.starswith("ES"):
+            if self.algorithm.startswith("RS") or self.algorithm.startswith("ES"):
                 logger.exception(
                     'Some algorithms requires "pip install cryptography". '
                     'See https://pyjwt.readthedocs.io/en/latest/installation.html#cryptographic-dependencies-optional')

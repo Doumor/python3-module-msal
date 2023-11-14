@@ -1,9 +1,8 @@
 # Microsoft Authentication Library (MSAL) for Python
 
-
-| `dev` branch | Reference Docs | # of Downloads
-|---------------|---------------|----------------|
- [![Build status](https://api.travis-ci.org/AzureAD/microsoft-authentication-library-for-python.svg?branch=dev)](https://travis-ci.org/AzureAD/microsoft-authentication-library-for-python) | [![Documentation Status](https://readthedocs.org/projects/msal-python/badge/?version=latest)](https://msal-python.readthedocs.io/en/latest/?badge=latest) | [![Download monthly](https://pepy.tech/badge/msal/month)](https://pypistats.org/packages/msal)
+| `dev` branch | Reference Docs | # of Downloads per different platforms | # of Downloads per recent MSAL versions | Benchmark Diagram |
+|:------------:|:--------------:|:--------------------------------------:|:---------------------------------------:|:-----------------:|
+ [![Build status](https://github.com/AzureAD/microsoft-authentication-library-for-python/actions/workflows/python-package.yml/badge.svg?branch=dev)](https://github.com/AzureAD/microsoft-authentication-library-for-python/actions) | [![Documentation Status](https://readthedocs.org/projects/msal-python/badge/?version=latest)](https://msal-python.readthedocs.io/en/latest/?badge=latest) | [![Downloads](https://static.pepy.tech/badge/msal)](https://pypistats.org/packages/msal) | [![Download monthly](https://static.pepy.tech/badge/msal/month)](https://pepy.tech/project/msal) | [📉](https://azuread.github.io/microsoft-authentication-library-for-python/dev/bench/)
 
 The Microsoft Authentication Library for Python enables applications to integrate with the [Microsoft identity platform](https://aka.ms/aaddevv2). It allows you to sign in users or apps with Microsoft identities ([Azure AD](https://azure.microsoft.com/services/active-directory/), [Microsoft Accounts](https://account.microsoft.com) and [Azure AD B2C](https://azure.microsoft.com/services/active-directory-b2c/) accounts) and obtain tokens to call Microsoft APIs such as [Microsoft Graph](https://graph.microsoft.io/) or your own APIs registered with the Microsoft identity platform. It is built using industry standard OAuth2 and OpenID Connect protocols
 
@@ -12,8 +11,14 @@ Not sure whether this is the SDK you are looking for your app? There are other M
 
 Quick links:
 
-| [Getting Started](https://docs.microsoft.com/azure/active-directory/develop/quickstart-v2-python-webapp) | [Docs](https://github.com/AzureAD/microsoft-authentication-library-for-python/wiki) | [Samples](https://aka.ms/aaddevsamplesv2) | [Support](README.md#community-help-and-support)
-| --- | --- | --- | --- |
+| [Getting Started](https://learn.microsoft.com/azure/active-directory/develop/web-app-quickstart?pivots=devlang-python)| [Docs](https://github.com/AzureAD/microsoft-authentication-library-for-python/wiki) | [Samples](https://aka.ms/aaddevsamplesv2) | [Support](README.md#community-help-and-support) | [Feedback](https://forms.office.com/r/TMjZkDbzjY) |
+| --- | --- | --- | --- | --- |
+
+## Scenarios supported
+
+Click on the following thumbnail to visit a large map with clickable links to proper samples.
+
+[![Map effect won't work inside github's markdown file, so we have to use a thumbnail here to lure audience to a real static website](https://raw.githubusercontent.com/AzureAD/microsoft-authentication-library-for-python/dev/docs/thumbnail.png)](https://msal-python.readthedocs.io/en/latest/)
 
 ## Installation
 
@@ -125,6 +130,9 @@ Also browser existing issues to see if someone has had your question before.
 We recommend you use the "msal" tag so we can see it!
 Here is the latest Q&A on Stack Overflow for MSAL:
 [http://stackoverflow.com/questions/tagged/msal](http://stackoverflow.com/questions/tagged/msal)
+
+## Submit Feedback
+We'd like your thoughts on this library. Please complete [this short survey.](https://forms.office.com/r/TMjZkDbzjY)
 
 ## Security Reporting
 

@@ -5,13 +5,19 @@ import logging
 
 from .authority import canonicalize
 from .oauth2cli.oidc import decode_part, decode_id_token
+from .oauth2cli.oauth2 import Client
 
 
 logger = logging.getLogger(__name__)
+_GRANT_TYPE_BROKER = "broker"
 
 def is_subdict_of(small, big):
     return dict(big, **small) == big
 
+def _get_username(id_token_claims):
+    return id_token_claims.get(
+        "preferred_username",  # AAD
+        id_token_claims.get("upn"))  # ADFS 2019
 
 class TokenCache(object):
     """This is considered as a base class containing minimal cache behavior.
@@ -98,27 +104,43 @@ class TokenCache(object):
                 ]
 
     def add(self, event, now=None):
-        # type: (dict) -> None
-        """Handle a token obtaining event, and add tokens into cache.
+        """Handle a token obtaining event, and add tokens into cache."""
+        def make_clean_copy(dictionary, sensitive_fields):  # Masks sensitive info
+            return {
+                k: "********" if k in sensitive_fields else v
+                for k, v in dictionary.items()
+            }
+        clean_event = dict(
+            event,
+            data=make_clean_copy(event.get("data", {}), (
+                "password", "client_secret", "refresh_token", "assertion",
+            )),
+            response=make_clean_copy(event.get("response", {}), (
+                "id_token_claims",  # Provided by broker
+                "access_token", "refresh_token", "id_token", "username",
+            )),
+        )
+        logger.debug("event=%s", json.dumps(
+        # We examined and concluded that this log won't have Log Injection risk,
+        # because the event payload is already in JSON so CR/LF will be escaped.
+            clean_event,
+            indent=4, sort_keys=True,
+            default=str,  # assertion is in bytes in Python 3
+        ))
+        return self.__add(event, now=now)
 
-        Known side effects: This function modifies the input event in place.
-        """
-        def wipe(dictionary, sensitive_fields):  # Masks sensitive info
-            for sensitive in sensitive_fields:
-                if sensitive in dictionary:
-                    dictionary[sensitive] = "********"
-        wipe(event.get("data", {}),
-            ("password", "client_secret", "refresh_token", "assertion", "username"))
-        try:
-            return self.__add(event, now=now)
-        finally:
-            wipe(event.get("response", {}), ("access_token", "refresh_token"))
-            logger.debug("event=%s", json.dumps(
-            # We examined and concluded that this log won't have Log Injection risk,
-            # because the event payload is already in JSON so CR/LF will be escaped.
-                event, indent=4, sort_keys=True,
-                default=str,  # A workaround when assertion is in bytes in Python 3
-                ))
+    def __parse_account(self, response, id_token_claims):
+        """Return client_info and home_account_id"""
+        if "client_info" in response:  # It happens when client_info and profile are in request
+            client_info = json.loads(decode_part(response["client_info"]))
+            if "uid" in client_info and "utid" in client_info:
+                return client_info, "{uid}.{utid}".format(**client_info)
+            # https://github.com/AzureAD/microsoft-authentication-library-for-python/issues/387
+        if id_token_claims:  # This would be an end user on ADFS-direct scenario
+            sub = id_token_claims["sub"]  # "sub" always exists, per OIDC specs
+            return {"uid": sub}, sub
+        # client_credentials flow will reach this code path
+        return {}, None
 
     def __add(self, event, now=None):
         # event typically contains: client_id, scope, token_endpoint,
@@ -133,26 +155,22 @@ class TokenCache(object):
         access_token = response.get("access_token")
         refresh_token = response.get("refresh_token")
         id_token = response.get("id_token")
-        id_token_claims = (
-            decode_id_token(id_token, client_id=event["client_id"])
-            if id_token else {})
-        client_info = {}
-        home_account_id = None  # It would remain None in client_credentials flow
-        if "client_info" in response:  # We asked for it, and AAD will provide it
-            client_info = json.loads(decode_part(response["client_info"]))
-            home_account_id = "{uid}.{utid}".format(**client_info)
-        elif id_token_claims:  # This would be an end user on ADFS-direct scenario
-            client_info["uid"] = id_token_claims.get("sub")
-            home_account_id = id_token_claims.get("sub")
+        id_token_claims = response.get("id_token_claims") or (  # Prefer the claims from broker
+            # Only use decode_id_token() when necessary, it contains time-sensitive validation
+            decode_id_token(id_token, client_id=event["client_id"]) if id_token else {})
+        client_info, home_account_id = self.__parse_account(response, id_token_claims)
 
-        target = ' '.join(event.get("scope", []))  # Per schema, we don't sort it
+        target = ' '.join(event.get("scope") or [])  # Per schema, we don't sort it
 
         with self._lock:
+            now = int(time.time() if now is None else now)
 
             if access_token:
-                now = int(time.time() if now is None else now)
+                default_expires_in = (  # https://www.rfc-editor.org/rfc/rfc6749#section-5.1
+                    int(response.get("expires_on")) - now  # Some Managed Identity emits this
+                    ) if response.get("expires_on") else 600
                 expires_in = int(  # AADv1-like endpoint returns a string
-			response.get("expires_in", 3599))
+                    response.get("expires_in", default_expires_in))
                 ext_expires_in = int(  # AADv1-like endpoint returns a string
 			response.get("ext_expires_in", expires_in))
                 at = {
@@ -170,6 +188,9 @@ class TokenCache(object):
                     }
                 if data.get("key_id"):  # It happens in SSH-cert or POP scenario
                     at["key_id"] = data.get("key_id")
+                if "refresh_in" in response:
+                    refresh_in = response["refresh_in"]  # It is an integer
+                    at["refresh_on"] = str(now + refresh_in)  # Schema wants a string
                 self.modify(self.CredentialType.ACCESS_TOKEN, at, at)
 
             if client_info and not event.get("skip_account_creation"):
@@ -177,16 +198,25 @@ class TokenCache(object):
                     "home_account_id": home_account_id,
                     "environment": environment,
                     "realm": realm,
-                    "local_account_id": id_token_claims.get(
-                        "oid", id_token_claims.get("sub")),
-                    "username": id_token_claims.get("preferred_username")  # AAD
-                        or id_token_claims.get("upn")  # ADFS 2019
+                    "local_account_id": event.get(
+                        "_account_id",  # Came from mid-tier code path.
+                            # Emperically, it is the oid in AAD or cid in MSA.
+                        id_token_claims.get("oid", id_token_claims.get("sub"))),
+                    "username": _get_username(id_token_claims)
+                        or data.get("username")  # Falls back to ROPC username
+                        or event.get("username")  # Falls back to Federated ROPC username
                         or "",  # The schema does not like null
-                    "authority_type":
+                    "authority_type": event.get(
+                        "authority_type",  # Honor caller's choice of authority_type
                         self.AuthorityType.ADFS if realm == "adfs"
-                        else self.AuthorityType.MSSTS,
+                            else self.AuthorityType.MSSTS),
                     # "client_info": response.get("client_info"),  # Optional
                     }
+                grant_types_that_establish_an_account = (
+                    _GRANT_TYPE_BROKER, "authorization_code", "password",
+                    Client.DEVICE_FLOW["GRANT_TYPE"])
+                if event.get("grant_type") in grant_types_that_establish_an_account:
+                    account["account_source"] = event["grant_type"]
                 self.modify(self.CredentialType.ACCOUNT, account, account)
 
             if id_token:
@@ -209,6 +239,7 @@ class TokenCache(object):
                     "environment": environment,
                     "client_id": event.get("client_id"),
                     "target": target,  # Optional per schema though
+                    "last_modification_time": str(now),  # Optional. Schema defines it as a string.
                     }
                 if "foci" in response:
                     rt["family_id"] = response["foci"]
@@ -234,8 +265,9 @@ class TokenCache(object):
         with self._lock:
             if new_key_value_pairs:  # Update with them
                 entries = self._cache.setdefault(credential_type, {})
-                entry = entries.setdefault(key, {})  # Create it if not yet exist
-                entry.update(new_key_value_pairs)
+                entries[key] = dict(
+                    old_entry,  # Do not use entries[key] b/c it might not exist
+                    **new_key_value_pairs)
             else:  # Remove old_entry
                 self._cache.setdefault(credential_type, {}).pop(key, None)
 
@@ -245,8 +277,10 @@ class TokenCache(object):
 
     def update_rt(self, rt_item, new_rt):
         assert rt_item.get("credential_type") == self.CredentialType.REFRESH_TOKEN
-        return self.modify(
-            self.CredentialType.REFRESH_TOKEN, rt_item, {"secret": new_rt})
+        return self.modify(self.CredentialType.REFRESH_TOKEN, rt_item, {
+            "secret": new_rt,
+            "last_modification_time": str(int(time.time())),  # Optional. Schema defines it as a string.
+            })
 
     def remove_at(self, at_item):
         assert at_item.get("credential_type") == self.CredentialType.ACCESS_TOKEN
